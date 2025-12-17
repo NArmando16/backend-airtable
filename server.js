@@ -2,12 +2,12 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const Papa = require("papaparse");
+const JSZip = require("jszip");
 
 const upload = multer();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 👇 Cambia esto por el dominio de tu frontend
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "*";
 
 app.use(
@@ -16,18 +16,19 @@ app.use(
   })
 );
 
+// Para leer JSON en POST (lista de URLs)
+app.use(express.json({ limit: "2mb" }));
+
 // ====== STORE EN MEMORIA (TEMPORAL) ======
 /*
   store = {
-    activeDate: "12/11/2025",
+    activeDate: "12/15/2025",
     ordersByCrewDevice: {
-      "584ArmandoNavarro": {
-        "TIKTOK USA 919": [
-          { id, rawText, meta: {...} },
-          ...
-        ]
+      "584": {
+        "919": [ { id, rawText, meta }, ... ],
+        "920": [ ... ]
       },
-      ...
+      "299": { ... }
     }
   }
 */
@@ -36,7 +37,7 @@ let store = {
   ordersByCrewDevice: {},
 };
 
-// ====== Helper: construir el bloque de texto "tipo Airtable" ======
+// ====== HELPERS ======
 function buildRawBlockFromRow(row) {
   const parts = [];
 
@@ -56,7 +57,10 @@ function buildRawBlockFromRow(row) {
   add("LINK PARA REPORTAR EL POST", row["LINK PARA REPORTAR EL POST"]);
   add("REPORTE DE CONTENIDO", row["REPORTE DE CONTENIDO"]);
   add("Sound Link", row["Sound Link"]);
-  add("New Genre (from Book Data) (from 3 Text)", row["New Genre (from Book Data) (from 3 Text)"]);
+  add(
+    "New Genre (from Book Data) (from 3 Text)",
+    row["New Genre (from Book Data) (from 3 Text)"]
+  );
   add("Type of Post", row["Type of Post"]);
   add("Text to use on post", row["Text to use on post"]);
   add(
@@ -73,10 +77,26 @@ function buildRawBlockFromRow(row) {
   return parts.join("\n");
 }
 
+// Extraer código numérico del crew: "584ArmandoNavarro" -> "584"
+function extractCrewCode(crew) {
+  if (!crew) return "";
+  const m = String(crew).trim().match(/^\d+/);
+  return m ? m[0] : String(crew).trim();
+}
+
+// Extraer código numérico del celular: "TIKTOK USA 920" -> "920"
+function extractDeviceCode(device) {
+  if (!device) return "";
+  const m = String(device).trim().match(/(\d+)\s*$/);
+  return m ? m[1] : String(device).trim();
+}
+
 // ====== ENDPOINT: subir CSV del día ======
 app.post("/api/import-csv", upload.single("file"), (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ ok: false, error: "No se recibió archivo CSV (campo 'file')." });
+    return res
+      .status(400)
+      .json({ ok: false, error: "No se recibió archivo CSV (campo 'file')." });
   }
 
   const csvStr = req.file.buffer.toString("utf8");
@@ -105,25 +125,28 @@ app.post("/api/import-csv", upload.single("file"), (req, res) => {
   let activeDate = null;
 
   rows.forEach((row) => {
-    const crew = (row["2 Crew"] || "").trim();
-    const device = (row["Celular"] || "").trim();
+    const crewFull = (row["2 Crew"] || "").trim();     // ej: "584ArmandoNavarro"
+    const deviceFull = (row["Celular"] || "").trim();  // ej: "TIKTOK USA 920"
     const dia = (row["Dia de Entregable"] || "").trim();
 
-    if (!crew || !device) return;
+    const crewCode = extractCrewCode(crewFull);        // "584"
+    const deviceCode = extractDeviceCode(deviceFull);  // "920"
+
+    if (!crewCode || !deviceCode) return;
 
     if (!activeDate && dia) activeDate = dia;
 
     const rawText = buildRawBlockFromRow(row);
     if (!rawText.trim()) return;
 
-    if (!store.ordersByCrewDevice[crew]) {
-      store.ordersByCrewDevice[crew] = {};
+    if (!store.ordersByCrewDevice[crewCode]) {
+      store.ordersByCrewDevice[crewCode] = {};
     }
-    if (!store.ordersByCrewDevice[crew][device]) {
-      store.ordersByCrewDevice[crew][device] = [];
+    if (!store.ordersByCrewDevice[crewCode][deviceCode]) {
+      store.ordersByCrewDevice[crewCode][deviceCode] = [];
     }
 
-    const list = store.ordersByCrewDevice[crew][device];
+    const list = store.ordersByCrewDevice[crewCode][deviceCode];
     const orderId = list.length + 1;
 
     const order = {
@@ -133,16 +156,18 @@ app.post("/api/import-csv", upload.single("file"), (req, res) => {
         entregableId: row["EntregableID"] || "",
         dia,
         cuenta: row["1 Cuenta"] || "",
-        crew,
-        device,
+        crewFull,
+        crewCode,
+        deviceFull,
+        deviceCode,
         typeOfPost: row["Type of Post"] || "",
       },
     };
 
     list.push(order);
     totalOrders++;
-    crewsSet.add(crew);
-    devicesSet.add(device);
+    crewsSet.add(crewCode);
+    devicesSet.add(deviceCode);
   });
 
   store.activeDate = activeDate || null;
@@ -158,17 +183,21 @@ app.post("/api/import-csv", upload.single("file"), (req, res) => {
 
 // ====== ENDPOINT: obtener órdenes para un worker + celular ======
 app.get("/api/orders", (req, res) => {
-  const crewId = (req.query.crewId || "").trim();
-  const deviceId = (req.query.deviceId || "").trim();
+  const crewParam = (req.query.crewId || "").trim();
+  const deviceParam = (req.query.deviceId || "").trim();
 
-  if (!crewId || !deviceId) {
+  if (!crewParam || !deviceParam) {
     return res
       .status(400)
       .json({ ok: false, error: "Faltan parámetros crewId y/o deviceId." });
   }
 
-  const byCrew = store.ordersByCrewDevice[crewId] || {};
-  const list = byCrew[deviceId] || [];
+  // Acepta tanto "584" como "584ArmandoNavarro"
+  const crewCode = extractCrewCode(crewParam);
+  const deviceCode = extractDeviceCode(deviceParam);
+
+  const byCrew = store.ordersByCrewDevice[crewCode] || {};
+  const list = byCrew[deviceCode] || [];
 
   return res.json({
     ok: true,
@@ -178,6 +207,76 @@ app.get("/api/orders", (req, res) => {
   });
 });
 
+// ====== ENDPOINT: generar ZIP con imágenes (server-side) ======
+app.post("/api/images-zip", async (req, res) => {
+  try {
+    const urls = req.body && Array.isArray(req.body.urls) ? req.body.urls : [];
+    if (!urls.length) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "No se recibieron URLs de imágenes." });
+    }
+
+    const zip = new JSZip();
+    let index = 1;
+
+    for (const rawUrl of urls) {
+      const url = String(rawUrl || "").trim();
+      if (!url) continue;
+
+      try {
+        const resp = await fetch(url); // Node 18+ tiene fetch global
+        if (!resp.ok) {
+          console.error("Error HTTP al descargar", url, resp.status);
+          continue;
+        }
+        const arrayBuf = await resp.arrayBuffer();
+
+        const extMatch = url.match(
+          /\.(jpe?g|png|webp|gif|heic|jpeg)(\?|$)/i
+        );
+        const ext = extMatch ? extMatch[1].toLowerCase() : "jpg";
+        const filename = `img_${String(index).padStart(3, "0")}.${ext}`;
+
+        zip.file(filename, Buffer.from(arrayBuf));
+        index++;
+      } catch (err) {
+        console.error("Error descargando", url, err);
+      }
+    }
+
+    if (index === 1) {
+      return res.status(500).json({
+        ok: false,
+        error: "No se pudo descargar ninguna imagen.",
+      });
+    }
+
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="imagenes_ordenes.zip"'
+    );
+    return res.send(zipBuffer);
+  } catch (err) {
+    console.error("Error generando ZIP", err);
+    return res.status(500).json({ ok: false, error: "Error generando ZIP." });
+  }
+});
+
+// ====== ENDPOINT: resetear todos los datos del backend ======
+app.post("/api/reset-store", (req, res) => {
+  store.activeDate = null;
+  store.ordersByCrewDevice = {};
+  return res.json({
+    ok: true,
+    message: "Store reseteada: se borraron todas las órdenes del backend.",
+  });
+});
+
+// ====== ROOT ======
 app.get("/", (_, res) => {
   res.send("Backend de órdenes TikTok funcionando.");
 });

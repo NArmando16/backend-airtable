@@ -1,5 +1,5 @@
 {
-  "name": "tt-orders-backend",
+  "name": "backend-airtable",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
@@ -9,6 +9,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.0",
+    "jszip": "^3.10.1",
     "multer": "^1.4.5-lts.1",
     "papaparse": "^5.4.1"
   }
